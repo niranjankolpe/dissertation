@@ -5,11 +5,13 @@ Output: output/1_standard/<plant_id>.csv             timestamp_utc, power_kw, cu
         output/1_standard/plants.csv                 one row per plant: capacity, location, orientation, source
         output/1_standard/conversion_report.csv      what the converter did to each plant (for checking by eye)
         output/1_standard/log.txt                    console messages of the last run
+        output/1_standard/raw_files.csv              every raw input file with size and MD5 (to check the inputs later)
 
 To add a dataset: write one reader that returns UTC-indexed power_kw and current_a (phases summed),
 then add one entry to PLANTS. Everything after that is the same for every plant.
 """
 import glob
+import hashlib
 import math
 import os
 import zipfile
@@ -92,6 +94,22 @@ def read_pvdaq_9068():
     return out[out.index.notna()]
 
 
+F_2107 = RAW / "pvdaq" / "2107_electrical_data_2024.csv"        # optional 5th plant; used only if present
+
+
+def read_pvdaq_2107():
+    # PVDAQ 2107 'Farm Solar Array', Arbuckle CA; 'measured_on' is local time, timezone_code PST8PDT (metadata)
+    # -> America/Los_Angeles (same rules). Inverter 01 only; column names found by prefix (metric ids may differ).
+    t = "measured_on"
+    head = pd.read_csv(F_2107, nrows=0).columns
+    pick = lambda pre: next(c for c in head if c.lower().startswith(pre))
+    pc, cc = pick("inv_01_ac_power"), pick("inv_01_ac_current")
+    d = pd.read_csv(F_2107, usecols=[t, pc, cc])
+    out = pd.DataFrame({"power_kw": d[pc].to_numpy(), "current_a": d[cc].to_numpy()})
+    out.index = pd.to_datetime(d[t]).dt.tz_localize("America/Los_Angeles", ambiguous="NaT", nonexistent="NaT").dt.tz_convert("UTC")
+    return out[out.index.notna()]
+
+
 # capacity_kw = AC rating of the device that measures power_kw. If it is not documented, it is left
 # empty here and estimated as the highest 5-min mean power (marked "estimated" in plants.csv).
 # tilt/azimuth only where documented (azimuth: degrees clockwise from north); otherwise CLePS uses horizontal.
@@ -112,6 +130,14 @@ PLANTS = [
          source="PVDAQ (OEDI), doi:10.25984/1846021; system 9068 'SR_CO', 4738 kW DC, 2 inverters, single-axis tracker "
                 "(not fixed -> horizontal used); 9068_system_metadata.json: inverter AC capacity 1910 kW"),
 ]
+if F_2107.exists():
+    PLANTS.append(dict(
+        plant_id="pvdaq_2107_inv01", reader=read_pvdaq_2107, capacity_kw=30.0, latitude=38.996306, longitude=-122.134111,
+        tilt_deg=25, azimuth_deg=180,
+        source="PVDAQ (OEDI) 2023 Solar Data Prize, system 2107 'Farm Solar Array', Arbuckle CA, 893 kW DC, "
+               "24 x ABB TRIO-27.6-TL-OUTD-S1B, fixed ground mount tilt 25 azimuth 180 (2107_system_metadata.json); "
+               "inverter rated AC power 27.6 kW, maximum AC output power 30 kW (ABB TRIO-20.0/27.6 datasheet, -400 "
+               "version; capacity = 30 kW because measured power reaches 30 kW)"))
 
 
 # ---------- the same steps for every plant ----------
@@ -189,6 +215,15 @@ def main():
                        "current_valid_pct": round(100 * float(std["current_a"].notna().mean()), 1),
                        "tz_check_min": tz_med, "tz_check_spread_min": tz_spread})
         log(f"[convert] {pid}: {report[-1]}")
+    raw = []
+    for f in sorted(p for p in RAW.rglob("*") if p.is_file()):
+        h = hashlib.md5()
+        with open(f, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        raw.append({"file": f.as_posix(), "bytes": f.stat().st_size, "md5": h.hexdigest()})
+    pd.DataFrame(raw).to_csv(OUT / "raw_files.csv", index=False)
+    log(f"[convert] {len(raw)} raw files listed in raw_files.csv")
     cols = ["plant_id", "capacity_kw", "capacity_note", "latitude", "longitude", "tilt_deg", "azimuth_deg", "source"]
     pd.DataFrame(plants)[cols].to_csv(OUT / "plants.csv", index=False)
     pd.DataFrame(report).to_csv(OUT / "conversion_report.csv", index=False)
